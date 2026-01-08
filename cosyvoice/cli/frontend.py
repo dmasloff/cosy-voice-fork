@@ -25,6 +25,7 @@ import re
 import inflect
 from cosyvoice.utils.file_utils import logging, load_wav
 from cosyvoice.utils.frontend_utils import contains_chinese, replace_blank, replace_corner_mark, remove_bracket, spell_out_number, split_paragraph, is_only_punctuation
+import s3tokenizer
 
 
 class CosyVoiceFrontEnd:
@@ -35,17 +36,32 @@ class CosyVoiceFrontEnd:
                  campplus_model: str,
                  speech_tokenizer_model: str,
                  spk2info: str = '',
-                 allowed_special: str = 'all'):
+                 allowed_special: str = 'all',
+                 use_onnx_speech_tokenizer: bool = True):
         self.tokenizer = get_tokenizer()
         self.feat_extractor = feat_extractor
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.use_onnx_speech_tokenizer = use_onnx_speech_tokenizer
         option = onnxruntime.SessionOptions()
         option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         option.intra_op_num_threads = 1
         self.campplus_session = onnxruntime.InferenceSession(campplus_model, sess_options=option, providers=["CPUExecutionProvider"])
-        self.speech_tokenizer_session = onnxruntime.InferenceSession(speech_tokenizer_model, sess_options=option,
-                                                                     providers=["CUDAExecutionProvider" if torch.cuda.is_available() else
-                                                                                "CPUExecutionProvider"])
+        if self.use_onnx_speech_tokenizer:
+            self.speech_tokenizer_session = onnxruntime.InferenceSession(speech_tokenizer_model, sess_options=option,
+                                                                        providers=["CUDAExecutionProvider" if torch.cuda.is_available() else
+                                                                                    "CPUExecutionProvider"])
+        elif 'v1' in speech_tokenizer_model:
+            self.speech_tokenizer_model = s3tokenizer.load_model("speech_tokenizer_v1_25hz").to(self.device)
+            self.speech_tokenizer_model.freeze()
+        elif 'v2' in speech_tokenizer_model:
+            self.speech_tokenizer_model = s3tokenizer.load_model("speech_tokenizer_v2_25hz").to(self.device)
+            self.speech_tokenizer_model.freeze()
+        elif 'v3' in speech_tokenizer_model:
+            self.speech_tokenizer_model = s3tokenizer.load_model("speech_tokenizer_v3_25hz").to(self.device)
+            self.speech_tokenizer_model.freeze()
+        else:
+            assert False, "Unidentified speech tokenizer"
+
         if os.path.exists(spk2info):
             self.spk2info = torch.load(spk2info, map_location=self.device, weights_only=True)
         else:
@@ -94,15 +110,46 @@ class CosyVoiceFrontEnd:
 
     def _extract_speech_token(self, prompt_wav):
         speech = load_wav(prompt_wav, 16000)
-        assert speech.shape[1] / 16000 <= 30, 'do not support extract speech token for audio longer than 30s'
-        feat = whisper.log_mel_spectrogram(speech, n_mels=128)
-        speech_token = self.speech_tokenizer_session.run(None,
-                                                         {self.speech_tokenizer_session.get_inputs()[0].name:
-                                                          feat.detach().cpu().numpy(),
-                                                          self.speech_tokenizer_session.get_inputs()[1].name:
-                                                          np.array([feat.shape[2]], dtype=np.int32)})[0].flatten().tolist()
-        speech_token = torch.tensor([speech_token], dtype=torch.int32).to(self.device)
-        speech_token_len = torch.tensor([speech_token.shape[1]], dtype=torch.int32).to(self.device)
+        return self._extract_speech_token_tensor(speech)
+
+    def _extract_speech_token_tensor(self, speech):
+        if self.use_onnx_speech_tokenizer:
+            assert speech.shape[1] / 16000 <= 30, 'do not support extract speech token for audio longer than 30s'
+            feat = whisper.log_mel_spectrogram(speech, n_mels=128)
+            speech_token = self.speech_tokenizer_session.run(None,
+                                                            {self.speech_tokenizer_session.get_inputs()[0].name:
+                                                            feat.detach().cpu().numpy(),
+                                                            self.speech_tokenizer_session.get_inputs()[1].name:
+                                                            np.array([feat.shape[2]], dtype=np.int32)})[0].flatten().tolist()
+            speech_token = torch.tensor([speech_token], dtype=torch.int32).to(self.device)
+            speech_token_len = torch.tensor([speech_token.shape[1]], dtype=torch.int32).to(self.device)
+        else:
+            mel = s3tokenizer.log_mel_spectrogram(speech, n_mels=128, device=self.device)
+            mels = mel.unsqueeze(0).to(self.device)
+            mels_lens = torch.tensor([mel.size(1)], dtype=torch.int32, device=self.device)
+            speech_token, speech_token_len = self.speech_tokenizer_model.quantize(mels, mels_lens)
+            speech_token = speech_token[:, :speech_token_len[0].item()]
+
+        return speech_token, speech_token_len
+
+    def _extract_speech_token_batch(self, wav_tensors):
+        if self.use_onnx_speech_tokenizer:
+            speech_lens = []
+            speech_tokens = []
+            for wav_tensor in wav_tensors:
+                speech_token, speech_token_len = self._extract_speech_token_tensor(wav_tensor)
+                speech_lens.append(speech_token_len)
+                speech_tokens.append(speech_token)
+            
+            speech_token_len = torch.cat(speech_lens, dim=0).to(self.device)
+            speech_token = s3tokenizer.padding(speech_tokens).to(self.device)
+        else:
+            mels = [s3tokenizer.log_mel_spectrogram(wav_tensor) for wav_tensor in wav_tensors]
+            mels, mels_lens = s3tokenizer.padding(mels)
+            mels = mels.to(self.device)
+            mels_lens = mels_lens.to(self.device)
+            speech_token, speech_token_len = self.speech_tokenizer_model.quantize(mels, mels_lens)
+        
         return speech_token, speech_token_len
 
     def _extract_spk_embedding(self, prompt_wav):
