@@ -16,6 +16,7 @@ from typing import Generator
 import json
 import onnxruntime
 import torch
+from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 import whisper
 from typing import Callable
@@ -143,7 +144,7 @@ class CosyVoiceFrontEnd:
                 speech_tokens.append(speech_token)
             
             speech_token, speech_token_len = s3tokenizer.padding(speech_tokens)
-            speech_token = speech_token.to(self.device)
+            speech_token = speech_token.squeeze(1).to(self.device)
             speech_token_len = speech_token_len.to(self.device)
         else:
             mels = [s3tokenizer.log_mel_spectrogram(wav_tensor[0], n_mels=128) for wav_tensor in wav_tensors]
@@ -151,7 +152,7 @@ class CosyVoiceFrontEnd:
             mels = mels.to(self.device)
             mels_lens = mels_lens.to(self.device)
             speech_token, speech_token_len = self.speech_tokenizer_model.quantize(mels, mels_lens)
-            speech_token = speech_token.unsqueeze(1)
+            speech_token = speech_token
         
         return speech_token, speech_token_len
 
@@ -167,11 +168,31 @@ class CosyVoiceFrontEnd:
         embedding = torch.tensor([embedding]).to(self.device)
         return embedding
 
+    def _extract_spk_embedding_batch(self, prompt_wavs):
+        embeddings = []
+        for speech in prompt_wavs:
+            feat = kaldi.fbank(speech,
+                           num_mel_bins=80,
+                           dither=0,
+                           sample_frequency=16000)
+            feat = feat - feat.mean(dim=0, keepdim=True)
+            embedding = self.campplus_session.run(None,
+                                                {self.campplus_session.get_inputs()[0].name: feat.unsqueeze(dim=0).cpu().numpy()})[0].flatten().tolist()
+            embedding = torch.tensor([embedding]).to(self.device)
+            embeddings.append(embedding)
+        return torch.cat(embeddings, dim=0).to(self.device)
+
     def _extract_speech_feat(self, prompt_wav):
         speech = load_wav(prompt_wav, 24000)
         speech_feat = self.feat_extractor(speech).squeeze(dim=0).transpose(0, 1).to(self.device)
         speech_feat = speech_feat.unsqueeze(dim=0)
         speech_feat_len = torch.tensor([speech_feat.shape[1]], dtype=torch.int32).to(self.device)
+        return speech_feat, speech_feat_len
+
+    def _extract_speech_feat_batch(self, prompt_wavs):
+        speech_feats = [self.feat_extractor(speech).squeeze(dim=0).transpose(0, 1).to(self.device) for speech in prompt_wavs]
+        speech_feat_len = torch.tensor([speech_feat.shape[0] for speech_feat in speech_feats], dtype=torch.int32).to(self.device)
+        speech_feat = pad_sequence(speech_feats, batch_first=True)
         return speech_feat, speech_feat_len
 
     def text_normalize(self, text, split=True, text_frontend=True):
@@ -267,6 +288,17 @@ class CosyVoiceFrontEnd:
         prompt_speech_feat, prompt_speech_feat_len = self._extract_speech_feat(prompt_wav)
         embedding = self._extract_spk_embedding(prompt_wav)
         source_speech_token, source_speech_token_len = self._extract_speech_token(source_speech_16k)
+        model_input = {'source_speech_token': source_speech_token, 'source_speech_token_len': source_speech_token_len,
+                       'flow_prompt_speech_token': prompt_speech_token, 'flow_prompt_speech_token_len': prompt_speech_token_len,
+                       'prompt_speech_feat': prompt_speech_feat, 'prompt_speech_feat_len': prompt_speech_feat_len,
+                       'flow_embedding': embedding}
+        return model_input
+
+    def frontend_vc_batch(self, source_speeches, prompt_wavs, resample_rate):
+        prompt_speech_token, prompt_speech_token_len = self._extract_speech_token_batch(prompt_wavs)
+        prompt_speech_feat, prompt_speech_feat_len = self._extract_speech_feat_batch(prompt_wavs)
+        embeddings = self._extract_spk_embedding_batch(prompt_wavs)
+        source_speech_token, source_speech_token_len = self._extract_speech_token_batch(prompt_wavs)
         model_input = {'source_speech_token': source_speech_token, 'source_speech_token_len': source_speech_token_len,
                        'flow_prompt_speech_token': prompt_speech_token, 'flow_prompt_speech_token_len': prompt_speech_token_len,
                        'prompt_speech_feat': prompt_speech_feat, 'prompt_speech_feat_len': prompt_speech_feat_len,

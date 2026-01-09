@@ -274,6 +274,120 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         assert feat.shape[2] == mel_len2
         return feat.float(), None
 
+    @torch.inference_mode
+    def batch_inference(self,
+                        token,
+                        token_len,
+                        prompt_token,
+                        prompt_token_len,
+                        prompt_feat,
+                        prompt_feat_len,
+                        embedding,
+                        streaming,
+                        finalize):
+        device = token.device
+        bs = token.shape[0]
+        # xvec projection
+        embedding = F.normalize(embedding, dim=1)
+        embedding = self.spk_embed_affine_layer(embedding)
+
+        # concat text and prompt_text
+        new_token_len = prompt_token_len + token_len
+
+        max_token_len = token_len.max().item()
+        max_prompt_token_len = prompt_token_len.max().item()
+        max_new_token_len = new_token_len.max().item()
+
+        new_token = torch.zeros((bs, max_new_token_len + 1), device=token.device, dtype=token.dtype)
+        new_token[:, :prompt_token.shape[1]] = prompt_token
+        grid = torch.arange(max_token_len).unsqueeze(0).repeat(bs, 1).to(device) + prompt_token_len.unsqueeze(1)
+
+        new_token.scatter_(
+            dim=1,
+            index=grid,
+            src=token,
+        )
+        token, token_len = new_token[:, :-1], new_token_len
+        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
+        token = self.input_embedding(torch.clamp(token, min=0)) * mask
+
+        # text encode
+        if finalize is True:
+            h, h_lengths = self.encoder(token, token_len, streaming=streaming)
+            h_lengths = h_lengths.to(dtype=torch.int32).squeeze(1).sum(dim=-1)
+        else:
+            # prepare context and token tensors for `self.pre_lookahead_layer`
+            context = torch.zeros((bs, self.pre_lookahead_len), device=token.device, dtype=token.dtype)
+
+            grid_end = torch.arange(-self.pre_lookahead_len, 0).unsqueeze(0).to(device) + new_token_len.unsqueeze(1)
+            grid_begin = torch.arange(0, self.pre_lookahead_len).unsqueeze(0).to(device) + new_token_len.unsqueeze(1)
+            grid = torch.max(grin_begin, grid_end)
+            grid = grid.masked_fill_(grid >= new_token_len.unsqueeze(1), max_new_token_len)
+
+            torch.gather(
+                new_token,
+                dim=1,
+                index=grid,
+                out=context
+            )
+            if max_new_token_len <= self.pre_lookahead_len:
+                token_pre = torch.zeros((bs, 0), device=token.device, dtype=token.dtype)
+            else:
+                token_pre = torch.zeros((bs, max_new_token_len - self.pre_lookahead_len), device=token.device, dtype=token.dtype)
+                token_pre_len = F.relu(new_token_len - self.pre_lookahead_len)
+
+                grid = torch.arange(0, max_new_token_len - self.pre_lookahead_layer).unsqueeze(0).to(device)
+                grid = grid.masked_fill_(grid >= (new_token_len.unsqueeze(1) - self.pre_lookahead_layer), max_new_token_len)
+
+                torch.gather(
+                    new_token,
+                    dim=1,
+                    index=grid,
+                    out=token_pre
+                )
+
+            h, h_lengths = self.encoder(token_pre, token_pre_len, context=context, streaming=streaming)
+            h_lengths = h_lengths.to(dtype=torch.int32).squeeze(1).sum(dim=-1)
+
+        h = self.encoder_proj(h)
+        mel_len = h_lengths
+        mel_len1 = prompt_feat_len
+        mel_len2 = h_lengths - prompt_feat_len
+
+        max_mel_len = mel_len.max().item()
+
+        # get conditions
+        conds = torch.zeros((bs, max_mel_len, self.output_size), device=token.device, dtype=h.dtype)
+        conds[:, :prompt_feat.shape[1], :] = prompt_feat
+        conds = conds.transpose(1, 2)
+
+        mask = (~make_pad_mask(mel_len)).to(h)
+        feat, _ = self.decoder(
+            mu=h.transpose(1, 2).contiguous(),
+            mask=mask.unsqueeze(1),
+            spks=embedding,
+            cond=conds,
+            n_timesteps=10,
+            streaming=streaming
+        )
+
+        max_mel_len2 = mel_len2.max().item()
+
+        feat_tensor = torch.zeros((bs, feat.shape[1], max_mel_len2), device=feat.device, dtype=feat.dtype)
+        grid = torch.arange(max_mel_len2).unsqueeze(0).to(device) + mel_len1.unsqueeze(1)
+        grid = grid.masked_fill_(grid <= mel_len.unsqueeze(1), feat.shape[2] - 1)
+        grid = grid.unsqueeze(1)
+        grid = grid.repeat(1, feat_tensor.shape[1], 1)
+
+        torch.gather(
+            feat,
+            dim=2,
+            index=grid,
+            out=feat_tensor,
+        )
+
+        return feat_tensor.float(), mel_len2
+
 
 class CausalMaskedDiffWithDiT(torch.nn.Module):
     def __init__(self,
@@ -401,6 +515,120 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
         return feat.float(), None
+
+    @torch.inference_mode
+    def batch_inference(self,
+                        token,
+                        token_len,
+                        prompt_token,
+                        prompt_token_len,
+                        prompt_feat,
+                        prompt_feat_len,
+                        embedding,
+                        streaming,
+                        finalize):
+        device = token.device
+        bs, dim = token.shape[0], token.shape[2]
+        # xvec projection
+        embedding = F.normalize(embedding, dim=1)
+        embedding = self.spk_embed_affine_layer(embedding)
+
+        # concat text and prompt_text
+        new_token_len = prompt_token_len + token_len
+
+        max_token_len = token_len.max().item()
+        max_prompt_token_len = prompt_token_len.max().item()
+        max_new_token_len = new_token_len.max().item()
+
+        new_token = torch.zeros((bs, max_new_token_len + 1, dim), device=token.device, dtype=token.dtype)
+        new_token[:, :max_prompt_token_len, :] = prompt_token
+        grid = torch.arange(max_token_len).unsqueeze(0).repeat(bs, 1).to(device)
+        grid = grid.masked_fill_(grid < token_len.unsqueeze(1), max_new_token_len - 1) + prompt_token_len.unsqueeze(1)
+
+        new_token.scatter_(
+            dim=1,
+            index=grid,
+            src=token,
+        )
+        token, token_len = new_token[:, :-1, :], new_token_len
+
+        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
+        token = self.input_embedding(torch.clamp(token, min=0)) * mask
+
+        # text encode
+        if finalize is True:
+            h = self.pre_lookahead_layer(token)
+        else:
+            # prepare context and token tensors for `self.pre_lookahead_layer`
+            context = torch.zeros((bs, self.pre_lookahead_len, dim), device=token.device, dtype=token.dtype)
+
+            grid_end = torch.arange(-self.pre_lookahead_len, 0).unsqueeze(0).to(device) + new_token_len.unsqueeze(1)
+            grid_begin = torch.arange(0, self.pre_lookahead_len).unsqueeze(0).to(device) + new_token_len.unsqueeze(1)
+            grid = torch.max(grin_begin, grid_end)
+            grid = grid.masked_fill_(grid >= new_token_len.unsqueeze(1), max_new_token_len)
+            grid = grid.repeat(1, 1, dim)
+
+            torch.gather(
+                new_token,
+                dim=1,
+                index=grid,
+                out=context
+            )
+            if max_new_token_len <= self.pre_lookahead_len:
+                token_pre = torch.zeros((bs, 0, dim), device=token.device, dtype=token.dtype)
+            else:
+                token_pre = torch.zeros((bs, max_new_token_len - self.pre_lookahead_len, dim), device=token.device, dtype=token.dtype)
+                token_pre_len = F.relu(max_new_token_len - self.pre_lookahead_len)
+
+                grid = torch.arange(0, max_new_token_len - self.pre_lookahead_layer).unsqueeze(0).to(device)
+                grid = grid.masked_fill_(grid >= (new_token_len.unsqueeze(1) - self.pre_lookahead_layer), max_new_token_len)
+                grid = grid.repeat(1, 1, dim)
+
+                torch.gather(
+                    new_token,
+                    dim=1,
+                    index=grid,
+                    out=token_pre
+                )
+
+            h = self.pre_lookahead_layer(token_pre, context=context)
+
+        h = h.repeat_interleave(self.token_mel_ratio, dim=1)
+
+        mel_len1, mel_len2 = prompt_feat_len, F.relu(token_pre_len - prompt_feat_len)
+        mel_len = mel_len1 + mel_len2
+        max_mel_len = (mel_len).max().item()
+
+        # get conditions
+        conds = torch.zeros((bs, max_mel_len, self.output_size), device=token.device, dtype=h.dtype)
+        conds[:, :prompt_feat.shape[1], :] = prompt_feat
+        conds = conds.transpose(1, 2)
+
+        mask = (~make_pad_mask(mel_len)).to(h)
+        feat, _ = self.decoder(
+            mu=h.transpose(1, 2).contiguous(),
+            mask=mask.unsqueeze(1),
+            spks=embedding,
+            cond=conds,
+            n_timesteps=10,
+            streaming=streaming
+        )
+
+        max_mel_len2 = mel_len2.max().item()
+
+        feat_tensor = torch.zeros((bs, feat.shape[1], max_mel_len2), device=feat.device, dtype=feat.dtype)
+        grid = torch.arange(max_mel_len2).unsqueeze(0).to(device) + mel_len1.unsqueeze(1)
+        grid = grid.masked_fill_(grid <= mel_len.unsqueeze(1), feat.shape[2] - 1)
+        grid = grid.unsqueeze(1)
+        grid = grid.repeat(1, feat_tensor.shape[1], 1)
+
+        torch.gather(
+            feat,
+            dim=2,
+            index=grid,
+            out=feat_tensor,
+        )
+        return feat_tensor, mel_len2
 
 
 if __name__ == '__main__':
