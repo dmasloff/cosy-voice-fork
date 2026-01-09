@@ -156,7 +156,8 @@ class CosyVoice2(CosyVoice):
                                           '{}/campplus.onnx'.format(model_dir),
                                           '{}/speech_tokenizer_v2.onnx'.format(model_dir),
                                           '{}/spk2info.pt'.format(model_dir),
-                                          configs['allowed_special'])
+                                          configs['allowed_special'],
+                                          configs['use_onnx_speech_tokenizer'])
         self.sample_rate = configs['sample_rate']
         if torch.cuda.is_available() is False and (load_jit is True or load_trt is True or load_vllm is True or fp16 is True):
             load_jit, load_trt, load_vllm, fp16 = False, False, False, False
@@ -206,7 +207,8 @@ class CosyVoice3(CosyVoice2):
                                           '{}/campplus.onnx'.format(model_dir),
                                           '{}/speech_tokenizer_v3.onnx'.format(model_dir),
                                           '{}/spk2info.pt'.format(model_dir),
-                                          configs['allowed_special'])
+                                          configs['allowed_special'],
+                                          configs['use_onnx_speech_tokenizer'])
         self.sample_rate = configs['sample_rate']
         if torch.cuda.is_available() is False and (load_trt is True or fp16 is True):
             load_trt, fp16 = False, False

@@ -53,12 +53,15 @@ class CosyVoiceFrontEnd:
         elif 'v1' in speech_tokenizer_model:
             self.speech_tokenizer_model = s3tokenizer.load_model("speech_tokenizer_v1_25hz").to(self.device)
             self.speech_tokenizer_model.freeze()
+            self.speech_tokenizer_model.eval()
         elif 'v2' in speech_tokenizer_model:
             self.speech_tokenizer_model = s3tokenizer.load_model("speech_tokenizer_v2_25hz").to(self.device)
             self.speech_tokenizer_model.freeze()
+            self.speech_tokenizer_model.eval()
         elif 'v3' in speech_tokenizer_model:
             self.speech_tokenizer_model = s3tokenizer.load_model("speech_tokenizer_v3_25hz").to(self.device)
             self.speech_tokenizer_model.freeze()
+            self.speech_tokenizer_model.eval()
         else:
             assert False, "Unidentified speech tokenizer"
 
@@ -124,7 +127,7 @@ class CosyVoiceFrontEnd:
             speech_token = torch.tensor([speech_token], dtype=torch.int32).to(self.device)
             speech_token_len = torch.tensor([speech_token.shape[1]], dtype=torch.int32).to(self.device)
         else:
-            mel = s3tokenizer.log_mel_spectrogram(speech, n_mels=128, device=self.device)
+            mel = s3tokenizer.log_mel_spectrogram(speech[0], n_mels=128)
             mels = mel.unsqueeze(0).to(self.device)
             mels_lens = torch.tensor([mel.size(1)], dtype=torch.int32, device=self.device)
             speech_token, speech_token_len = self.speech_tokenizer_model.quantize(mels, mels_lens)
@@ -134,21 +137,21 @@ class CosyVoiceFrontEnd:
 
     def _extract_speech_token_batch(self, wav_tensors):
         if self.use_onnx_speech_tokenizer:
-            speech_lens = []
             speech_tokens = []
             for wav_tensor in wav_tensors:
-                speech_token, speech_token_len = self._extract_speech_token_tensor(wav_tensor)
-                speech_lens.append(speech_token_len)
+                speech_token, _ = self._extract_speech_token_tensor(wav_tensor)
                 speech_tokens.append(speech_token)
             
-            speech_token_len = torch.cat(speech_lens, dim=0).to(self.device)
-            speech_token = s3tokenizer.padding(speech_tokens).to(self.device)
+            speech_token, speech_token_len = s3tokenizer.padding(speech_tokens)
+            speech_token = speech_token.to(self.device)
+            speech_token_len = speech_token_len.to(self.device)
         else:
-            mels = [s3tokenizer.log_mel_spectrogram(wav_tensor) for wav_tensor in wav_tensors]
+            mels = [s3tokenizer.log_mel_spectrogram(wav_tensor[0], n_mels=128) for wav_tensor in wav_tensors]
             mels, mels_lens = s3tokenizer.padding(mels)
             mels = mels.to(self.device)
             mels_lens = mels_lens.to(self.device)
             speech_token, speech_token_len = self.speech_tokenizer_model.quantize(mels, mels_lens)
+            speech_token = speech_token.unsqueeze(1)
         
         return speech_token, speech_token_len
 
