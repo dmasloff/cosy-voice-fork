@@ -321,7 +321,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
 
             grid_end = torch.arange(-self.pre_lookahead_len, 0).unsqueeze(0).to(device) + new_token_len.unsqueeze(1)
             grid_begin = torch.arange(0, self.pre_lookahead_len).unsqueeze(0).to(device) + new_token_len.unsqueeze(1)
-            grid = torch.max(grin_begin, grid_end)
+            grid = torch.max(grid_begin, grid_end)
             grid = grid.masked_fill_(grid >= new_token_len.unsqueeze(1), max_new_token_len)
 
             torch.gather(

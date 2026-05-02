@@ -7,7 +7,6 @@ import torch
 import torchaudio
 from tqdm import trange
 
-import onnxruntime as ort
 from hyperpyyaml import load_hyperpyyaml
 from cosyvoice.cli.cosyvoice import CosyVoice2, CosyVoice3
 from cosyvoice.utils.file_utils import load_wav
@@ -40,17 +39,15 @@ def reconstruct_wav(wav: str) -> torch.Tensor:
 
     return speech
 
+
 for i in trange(1, 245):
     directory = pathlib.Path(f'../buldjat_stripped/{i}')
 
     try:
         tracks = os.listdir(directory)
         for track in tracks:
-            if not track.endswith('.mp3') or track.endswith('_r.mp3') or track.endswith('_r2.mp3'):
-                continue
-
             reconstructed_audio = reconstruct_wav(directory / pathlib.Path(track))
-            torchaudio.save(directory / pathlib.Path(track.rsplit('.mp3', 1)[0] + '_r2.mp3'), reconstructed_audio.cpu(), model.sample_rate)
+            torchaudio.save(directory / pathlib.Path(track.rsplit('.mp3', 1)[0] + '_r.mp3'), reconstructed_audio.cpu(), model.sample_rate)
 
     except FileNotFoundError:
         continue
